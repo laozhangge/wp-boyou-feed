@@ -16,7 +16,8 @@ get_header();
 
 $rss_json_url = get_option('riven_cat_rss_json', '');
 if ($rss_json_url === '') {
-    $rss_json_url = wbf_json_url();
+    // 空则走本地数据文件（1.6.4 起在 uploads/rss-<随机>/boyou.json），直接给路径，不绕 URL
+    $rss_json_url = wbf_json_path();
 }
 
 // Helper functions

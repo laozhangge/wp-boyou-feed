@@ -43,6 +43,9 @@ function wbf_sync_run($apiBase, $user, $password) {
 
     // 5. 保存 JSON（包装成带元数据的对象）
     $jsonPath = wbf_json_path();
+    if ('' === $jsonPath) {
+        return array('success' => false, 'message' => '数据目录不可用：uploads 目录不可写。', 'count' => 0);
+    }
     $subsCompact = wbf_compact_subs($subscriptions);
     $output = array(
         'articles' => $formatted,
@@ -70,23 +73,163 @@ function wbf_sync_run($apiBase, $user, $password) {
 }
 
 /**
+ * 数据目录：uploads/rss-<32 位随机>/
+ *
+ * 为什么要随机（1.6.4，2026-10-30）：
+ *   原来固定写在 uploads/riven-rss/output.json —— 那是 Web 根目录下给公网读的地方，
+ *   文件一落地就有 URL，任何人拿到地址都能下载**全部订阅的站名、站址、文章摘要**。
+ *   插件给别人的站用，不能默认送一个泄露点，也不能指望每个站长都去翻 Nginx 配置。
+ *
+ *   随机目录名让 URL 猜不出来（128 位），目录里再放 .htaccess 硬拦一层（Apache 生效）。
+ *   Nginx 不认 .htaccess，但随机路径那层仍然在。
+ *
+ *   改名存 option 而不是常量：每站一个，也不会因为换域名、改 wp_salt 而失效。
+ */
+function wbf_data_slug() {
+	$slug = (string) get_option( 'wbf_data_dir', '' );
+	return preg_match( '/^rss-[a-f0-9]{32}$/', $slug ) ? $slug : '';
+}
+
+/**
+ * 数据目录的绝对路径。
+ *
+ * 建不出来（uploads 不可写这种残废主机）就退回老目录 —— 安全加固不能把功能搞死，
+ * 那种环境下站点连媒体都传不上去，也不在这一条规则的管辖范围内。
+ *
+ * @return string
+ */
+function wbf_json_dir() {
+	$uploads = wp_upload_dir();
+	$base    = isset( $uploads['basedir'] ) ? rtrim( (string) $uploads['basedir'], '/' ) : '';
+	if ( '' === $base ) {
+		return '';
+	}
+
+	$slug = wbf_data_slug();
+	if ( '' === $slug ) {
+		$slug = 'rss-' . bin2hex( random_bytes( 16 ) );
+		update_option( 'wbf_data_dir', $slug, false );
+	}
+
+	$dir = $base . '/' . $slug;
+	if ( ! is_dir( $dir ) && ! wp_mkdir_p( $dir ) ) {
+		$dir = $base . '/riven-rss';
+		wp_mkdir_p( $dir );
+	}
+
+	wbf_guard_data_dir( $dir );
+
+	return $dir;
+}
+
+/**
+ * 往数据目录里放防护文件。
+ *
+ * - .htaccess：Apache 下直接 403（Nginx 不读，无害）
+ * - index.php / index.html：防止目录被列出
+ *
+ * @param string $dir 数据目录。
+ */
+function wbf_guard_data_dir( $dir ) {
+	$dir = rtrim( (string) $dir, '/' );
+	if ( '' === $dir || ! is_dir( $dir ) ) {
+		return;
+	}
+
+	$htaccess = $dir . '/.htaccess';
+	if ( ! file_exists( $htaccess ) ) {
+		$rules = "# wp-boyou-feed 数据目录，禁止直接访问（文件内容只给 PHP 读）\n"
+			. "<IfModule mod_authz_core.c>\n"
+			. "\tRequire all denied\n"
+			. "</IfModule>\n"
+			. "<IfModule !mod_authz_core.c>\n"
+			. "\tOrder allow,deny\n"
+			. "\tDeny from all\n"
+			. "</IfModule>\n";
+		@file_put_contents( $htaccess, $rules ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+	}
+
+	$index_php = $dir . '/index.php';
+	if ( ! file_exists( $index_php ) ) {
+		@file_put_contents( $index_php, "<?php\n// Silence is golden.\n" ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+	}
+
+	$index_html = $dir . '/index.html';
+	if ( ! file_exists( $index_html ) ) {
+		@file_put_contents( $index_html, '' ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+	}
+}
+
+/**
+ * 老数据迁移：uploads/riven-rss/output.json → 随机目录下的 boyou.json。
+ *
+ * 只做一次（option 打标）。搬完删旧文件、旧目录空了就删目录 —— 旧目录是固定的、
+ * 可猜的地址，留着等于白改。
+ */
+function wbf_maybe_migrate_data() {
+	if ( get_option( 'wbf_data_migrated' ) ) {
+		return;
+	}
+
+	$uploads = wp_upload_dir();
+	$base    = isset( $uploads['basedir'] ) ? rtrim( (string) $uploads['basedir'], '/' ) : '';
+	if ( '' === $base ) {
+		return;
+	}
+
+	$old = $base . '/riven-rss/output.json';
+	if ( ! file_exists( $old ) ) {
+		update_option( 'wbf_data_migrated', 1, false );
+		return;
+	}
+
+	$new = wbf_json_path();
+	if ( '' === $new ) {
+		return;
+	}
+
+	if ( ! file_exists( $new ) ) {
+		if ( ! @rename( $old, $new ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			$body = @file_get_contents( $old ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			if ( false !== $body ) {
+				@file_put_contents( $new, $body ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+			}
+		}
+	}
+
+	// 新文件就位才删旧的，宁可留着也不能丢数据
+	if ( file_exists( $new ) && filesize( $new ) > 0 ) {
+		@unlink( $old ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		$old_dir = dirname( $old );
+		$left    = @scandir( $old_dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		if ( is_array( $left ) && 2 === count( $left ) ) { // 只有 . 和 ..
+			@rmdir( $old_dir ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		}
+		update_option( 'wbf_data_migrated', 1, false );
+	}
+}
+
+/**
  * 获取 JSON 文件路径
  */
 function wbf_json_path() {
-    $upload_dir = wp_upload_dir();
-    $dir = $upload_dir['basedir'] . '/riven-rss';
-    if (!is_dir($dir)) {
-        wp_mkdir_p($dir);
-    }
-    return $dir . '/output.json';
+	$dir = wbf_json_dir();
+	return '' === $dir ? '' : $dir . '/boyou.json';
 }
 
 /**
  * 获取 JSON 文件 URL
+ *
+ * 只在「自定义 JSON 地址」这类兜底路径里用，前台不会把它输出到页面。
  */
 function wbf_json_url() {
-    $upload_dir = wp_upload_dir();
-    return $upload_dir['baseurl'] . '/riven-rss/output.json';
+	$uploads = wp_upload_dir();
+	$base    = isset( $uploads['baseurl'] ) ? rtrim( (string) $uploads['baseurl'], '/' ) : '';
+	$slug    = wbf_data_slug();
+	if ( '' === $base || '' === $slug ) {
+		return '';
+	}
+	return $base . '/' . $slug . '/boyou.json';
 }
 
 /**

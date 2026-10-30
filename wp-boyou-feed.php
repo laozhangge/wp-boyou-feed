@@ -3,7 +3,7 @@
  * Plugin Name: WP 博友动态
  * Plugin URI:  https://laozhang.org/
  * Description: 把你 RSS 订阅的博友更新聚合到一个页面，顺带对账：这些博友最近一次来你博客留言是什么时候。数据源支持 FreshRSS（Google Reader API）。
- * Version:     1.6.3
+ * Version:     1.6.4
  * Author:      老张
  * Author URI:  https://laozhang.org/
  * Requires PHP: 7.4
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'WBF_VERSION', '1.6.3' );
+define( 'WBF_VERSION', '1.6.4' );
 define( 'WBF_FILE', __FILE__ );
 define( 'WBF_DIR', plugin_dir_path( __FILE__ ) );
 define( 'WBF_URL', plugin_dir_url( __FILE__ ) );
@@ -49,6 +49,14 @@ require_once WBF_DIR . 'inc/subscriptions.php';
 
 // 自更新检查（必须无条件加载，停用状态下也要能收到升级提示）
 require_once WBF_DIR . 'inc/updater.php';
+
+/**
+ * 数据目录迁移：老的 uploads/riven-rss/output.json → 随机目录。
+ *
+ * 挂在 init 上而不是激活钩子：在线升级不会触发 register_activation_hook，
+ * 老站升级上来只有 init 会跑。函数内部自己打标，只搬一次。
+ */
+add_action( 'init', 'wbf_maybe_migrate_data', 5 );
 
 /**
  * 这个页面要不要用插件的模板渲染。

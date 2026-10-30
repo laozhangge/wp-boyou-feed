@@ -190,6 +190,16 @@ function wbf_fetch_from_json($jsonUrl, $limit = 200) {
     $body = '';
 
     /*
+     * ⓪ 直接给的是本地绝对路径 → 读盘。
+     *
+     * 1.6.4 起数据文件在 uploads/rss-<随机>/ 下，前台直接把路径传进来，
+     * 不再绕成 URL 再映射回去 —— 省一层，也不会因为 CDN/上传目录分离而映射失败。
+     */
+    if ( '' !== $jsonUrl && is_file( $jsonUrl ) && is_readable( $jsonUrl ) ) {
+        $body = (string) @file_get_contents( $jsonUrl ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+    }
+
+    /*
      * ① 本站 uploads 下的文件 → 直接读磁盘，不经过网络。
      *
      * 这条分支是 1.3.8 加的。原来只有 ②，于是「服务器访问不了自己域名」的机器
@@ -197,7 +207,7 @@ function wbf_fetch_from_json($jsonUrl, $limit = 200) {
      * 页面却报 cURL error 28）。
      */
     $local_path = wbf_local_path_for_url($jsonUrl);
-    if ($local_path !== '' && is_file($local_path) && is_readable($local_path)) {
+    if ($body === '' && $local_path !== '' && is_file($local_path) && is_readable($local_path)) {
         $body = (string) @file_get_contents($local_path); // phpcs:ignore WordPress.WP.AlternativeFunctions
     }
 

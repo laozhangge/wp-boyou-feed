@@ -105,6 +105,85 @@ function wbf_handle_save() {
 add_action( 'admin_post_wbf_save', 'wbf_handle_save' );
 
 /**
+ * 数据文件的公网自检。
+ *
+ * 为什么要有：数据目录名是随机生成的（128 位），正常没人猜得到；目录里也放了
+ * .htaccess 硬拦 —— 但那只在 Apache 生效，Nginx/IIS 不认。插件改不了别人的
+ * Web 服务器配置，能做的只有「发现被暴露就说清楚」：真的去请求一次自己的地址，
+ * 拿到 200 且内容是我们的数据 → 亮红警告，给出可复制的规则。
+ *
+ * 服务器访问不了自己域名（hairpin）时拿不到结论，就什么都不说，不瞎报警。
+ *
+ * @return array{state:string,url:string}
+ */
+function wbf_self_exposure_check() {
+	$url = wbf_json_url();
+	if ( '' === $url ) {
+		return array( 'state' => 'unknown', 'url' => '' );
+	}
+
+	$cache = get_transient( 'wbf_exposure_check' );
+	if ( is_array( $cache ) ) {
+		return $cache;
+	}
+
+	$resp = wp_remote_get(
+		$url,
+		array(
+			'timeout'   => 6,
+			'sslverify' => false,
+			'headers'   => array( 'Cache-Control' => 'no-cache' ),
+		)
+	);
+
+	$out = array( 'state' => 'unknown', 'url' => $url );
+
+	/*
+	 * 先按公网地址请求。有的服务器访问不了自己的域名（hairpin NAT），
+	 * 这时走回环：127.0.0.1 + Host 头，Nginx 照样按 server_name 匹配，
+	 * 判定规则是否生效是准的（只是证明不了外网可达，所以 403 才敢说 closed）。
+	 */
+	$probes = array( $url );
+	$parts  = wp_parse_url( $url );
+	if ( ! empty( $parts['host'] ) && ! empty( $parts['path'] ) ) {
+		$scheme   = ! empty( $parts['scheme'] ) ? $parts['scheme'] : 'https';
+		$probes[] = $scheme . '://127.0.0.1' . $parts['path'];
+	}
+
+	foreach ( $probes as $i => $probe ) {
+		$args = array(
+			'timeout'   => 6,
+			'sslverify' => false,
+			'headers'   => array( 'Cache-Control' => 'no-cache' ),
+		);
+		if ( $i > 0 ) {
+			$args['headers']['Host'] = $parts['host'];
+		}
+
+		$resp = wp_remote_get( $probe, $args );
+		if ( is_wp_error( $resp ) ) {
+			continue;
+		}
+
+		$code = (int) wp_remote_retrieve_response_code( $resp );
+		$body = (string) wp_remote_retrieve_body( $resp );
+
+		if ( 200 === $code && false !== strpos( $body, '"articles"' ) ) {
+			$out['state'] = 'open';
+			break;
+		}
+		if ( in_array( $code, array( 403, 404 ), true ) ) {
+			$out['state'] = 'closed';
+			break;
+		}
+	}
+
+	set_transient( 'wbf_exposure_check', $out, 6 * HOUR_IN_SECONDS );
+
+	return $out;
+}
+
+/**
  * 设置页。
  */
 function wbf_settings_page() {
@@ -112,7 +191,7 @@ function wbf_settings_page() {
 	$last_str  = $last_sync > 0 ? get_date_from_gmt( gmdate( 'Y-m-d H:i:s', $last_sync ), 'Y-m-d H:i' ) : '从未同步';
 
 	$json_path = wbf_json_path();
-	$json_ok   = file_exists( $json_path );
+	$json_ok   = '' !== $json_path && file_exists( $json_path );
 	$json_time = $json_ok ? get_date_from_gmt( gmdate( 'Y-m-d H:i:s', filemtime( $json_path ) ), 'Y-m-d H:i' ) : '-';
 	$count     = 0;
 	if ( $json_ok ) {
@@ -142,6 +221,29 @@ function wbf_settings_page() {
 				定时任务每小时检查一次，到点才真正拉取。
 			</p>
 		</div>
+
+		<?php
+		$wbf_exposure = wbf_self_exposure_check();
+		$wbf_is_nginx = isset( $_SERVER['SERVER_SOFTWARE'] ) && false !== stripos( (string) $_SERVER['SERVER_SOFTWARE'], 'nginx' );
+		if ( 'open' === $wbf_exposure['state'] ) :
+			?>
+			<div class="notice notice-error">
+				<p><b>你的数据文件现在能被公网直接下载。</b>里面是全部订阅的站名、站址和文章摘要。目录名是 128 位随机串，正常猜不出来，但这个地址一旦被日志、截图、备份带出去，别人就能整份拿走。</p>
+				<p>目录里已经放了 <code>.htaccess</code>，<b>Apache 主机不用管</b>（已生效）。你这台是 Nginx / IIS，需要在站点配置里加一条，然后重载 Web 服务器：</p>
+				<pre style="padding:10px 12px;background:#f6f7f7;border:1px solid #dcdcde;overflow:auto;">location ^~ /wp-content/uploads/<?php echo esc_html( wbf_data_slug() ); ?>/ {
+    deny all;
+}</pre>
+				<p class="description">加完刷新本页，警告会消失（自检结果缓存 6 小时）。</p>
+			</div>
+		<?php elseif ( 'unknown' === $wbf_exposure['state'] && $wbf_is_nginx ) : ?>
+			<div class="notice notice-warning">
+				<p>数据目录是随机名（<code><?php echo esc_html( wbf_data_slug() ); ?></code>），正常猜不出来；但你这台是 <b>Nginx</b>，不认目录里的 <code>.htaccess</code>。想彻底关死，在站点配置里加一条再重载即可：</p>
+				<pre style="padding:10px 12px;background:#f6f7f7;border:1px solid #dcdcde;overflow:auto;">location ^~ /wp-content/uploads/<?php echo esc_html( wbf_data_slug() ); ?>/ {
+    deny all;
+}</pre>
+				<p class="description">服务器访问不了自己的域名，所以这里没法替你实测——没加也不影响功能，只是多一道保险。</p>
+			</div>
+		<?php endif; ?>
 
 		<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
 			<input type="hidden" name="action" value="wbf_save">

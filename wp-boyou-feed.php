@@ -3,7 +3,7 @@
  * Plugin Name: WP 博友动态
  * Plugin URI:  https://laozhang.org/
  * Description: 把你 RSS 订阅的博友更新聚合到一个页面，顺带对账：这些博友最近一次来你博客留言是什么时候。数据源支持 FreshRSS（Google Reader API）。
- * Version:     1.6.4
+ * Version:     1.6.5
  * Author:      老张
  * Author URI:  https://laozhang.org/
  * Requires PHP: 7.4
@@ -19,7 +19,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'WBF_VERSION', '1.6.4' );
+define( 'WBF_VERSION', '1.6.5' );
 define( 'WBF_FILE', __FILE__ );
 define( 'WBF_DIR', plugin_dir_path( __FILE__ ) );
 define( 'WBF_URL', plugin_dir_url( __FILE__ ) );
@@ -182,13 +182,14 @@ add_action( 'admin_enqueue_scripts', 'wbf_admin_assets' );
 /**
  * 跑一次同步。
  *
+ * @param bool $force 忽略数据量骤降保护，强制覆盖。
  * @return array
  */
-function wbf_do_sync() {
+function wbf_do_sync( $force = false ) {
 	$api  = (string) get_option( 'riven_rss_freshrss_api', '' );
 	$user = (string) get_option( 'riven_rss_freshrss_user', '' );
 	$pass = (string) get_option( 'riven_rss_freshrss_pass', '' );
-	return wbf_sync_run( $api, $user, $pass );
+	return wbf_sync_run( $api, $user, $pass, (bool) $force );
 }
 
 /**
@@ -200,7 +201,8 @@ function wbf_ajax_sync() {
 		wp_send_json_error( array( 'message' => '权限不足' ) );
 	}
 
-	$result = wbf_do_sync();
+	$force  = ! empty( $_POST['force'] );
+	$result = wbf_do_sync( $force );
 	if ( ! empty( $result['success'] ) ) {
 		wp_send_json_success( $result );
 	}

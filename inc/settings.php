@@ -282,22 +282,37 @@ function wbf_settings_page() {
 		jQuery(function ($) {
 			$('#wbf-sync-btn').on('click', function () {
 				var btn = $(this), st = $('#wbf-sync-status');
-				btn.prop('disabled', true).text('⏳ 同步中...');
-				st.text('').css('color', '');
-				$.post(ajaxurl, {
-					action: 'wbf_sync',
-					_wpnonce: '<?php echo esc_js( wp_create_nonce( 'wbf_sync' ) ); ?>'
-				}, function (res) {
-					btn.prop('disabled', false).text('🔄 立即同步');
-					if (res.success) {
-						st.text('✅ ' + res.data.message + '（' + res.data.count + ' 篇）').css('color', '#46b450');
-					} else {
+
+				function run(force) {
+					btn.prop('disabled', true).text('⏳ 同步中...');
+					st.text('').css('color', '');
+					$.post(ajaxurl, {
+						action: 'wbf_sync',
+						_wpnonce: '<?php echo esc_js( wp_create_nonce( 'wbf_sync' ) ); ?>',
+						force: force ? 1 : 0
+					}, function (res) {
+						if (res.success) {
+							btn.prop('disabled', false).text('🔄 立即同步');
+							st.text('✅ ' + res.data.message + '（' + res.data.count + ' 篇）').css('color', '#46b450');
+							return;
+						}
+						if (res.data && res.data.guarded) {
+							btn.prop('disabled', false).text('🔄 立即同步');
+							st.text('⚠️ ' + res.data.message).css('color', '#dba617');
+							if (confirm(res.data.message + '\n\n确定要用这份数据覆盖现在这份吗？')) {
+								run(true);
+							}
+							return;
+						}
+						btn.prop('disabled', false).text('🔄 立即同步');
 						st.text('❌ ' + (res.data && res.data.message ? res.data.message : '未知错误')).css('color', '#dc3232');
-					}
-				}).fail(function () {
-					btn.prop('disabled', false).text('🔄 立即同步');
-					st.text('❌ 请求失败').css('color', '#dc3232');
-				});
+					}).fail(function () {
+						btn.prop('disabled', false).text('🔄 立即同步');
+						st.text('❌ 请求失败').css('color', '#dc3232');
+					});
+				}
+
+				run(false);
 			});
 		});
 		</script>

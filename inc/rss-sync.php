@@ -11,9 +11,10 @@ if (!defined('ABSPATH')) exit;
  * @param string $apiBase  FreshRSS API 地址
  * @param string $user     用户名
  * @param string $password API 密码
+ * @param bool   $force    忽略「数据量骤降」保护，强制覆盖（默认 false）
  * @return array 结果 ['success' => bool, 'message' => string, 'count' => int]
  */
-function wbf_sync_run($apiBase, $user, $password) {
+function wbf_sync_run($apiBase, $user, $password, $force = false) {
     $apiBase = rtrim(trim($apiBase), '/');
     if ($apiBase === '' || $user === '' || $password === '') {
         return array('success' => false, 'message' => 'FreshRSS API 地址、用户名或密码未配置。', 'count' => 0);
@@ -46,6 +47,35 @@ function wbf_sync_run($apiBase, $user, $password) {
     if ('' === $jsonPath) {
         return array('success' => false, 'message' => '数据目录不可用：uploads 目录不可写。', 'count' => 0);
     }
+
+    /*
+     * 数据量骤降保护（1.6.5）：
+     * 2026-11-09 的事故里，一次坏同步把 321 篇写成 23 篇，文件当场覆盖，
+     * 除了人眼看页面没别的信号。这里拿旧文件比一下：新数据不到旧的一半、
+     * 且旧数据本来有 100 篇以上，就不覆盖，把判断权交回给人。
+     */
+    $newCount = count($formatted);
+    $oldCount = 0;
+    if (is_file($jsonPath)) {
+        $oldData = json_decode((string) @file_get_contents($jsonPath), true);
+        if (is_array($oldData) && isset($oldData['articles']) && is_array($oldData['articles'])) {
+            $oldCount = count($oldData['articles']);
+        }
+    }
+    if (!$force && $oldCount >= 100 && $newCount < $oldCount * 0.5) {
+        return array(
+            'success'   => false,
+            'guarded'   => true,
+            'count'     => $newCount,
+            'old_count' => $oldCount,
+            'message'   => sprintf(
+                '本次只拉到 %d 篇，上次是 %d 篇，差距太大，已保留原数据。请先到 FreshRSS 看看有没有源在刷历史文章，确认没问题再点「强制同步」。',
+                $newCount,
+                $oldCount
+            ),
+        );
+    }
+
     $subsCompact = wbf_compact_subs($subscriptions);
     $output = array(
         'articles' => $formatted,
@@ -69,7 +99,64 @@ function wbf_sync_run($apiBase, $user, $password) {
     // 更新同步时间
     update_option('riven_rss_last_sync', current_time('timestamp'));
 
+    // 页面缓存必须跟着换，否则访客看到的还是上一版列表
+    wbf_purge_front_cache();
+
     return array('success' => true, 'message' => '同步成功', 'count' => count($formatted));
+}
+
+/**
+ * 清掉博友页与首页的整页缓存。
+ *
+ * 为什么必须清（1.6.5，2026-11-09）：
+ *   同步只换了数据文件，页面缓存还是旧的。那天数据已经缩到 23 篇，访客看到的
+ *   却是几小时前的完整列表 —— 故障被缓存藏起来了，只有站长自己点开后台才会发现。
+ *
+ * 只清首页和博友页，不动整站：整站缓存一清，全部页面回源，流量站扛不住。
+ * 其他缓存插件不去猜它们的内部 API，留一个 action 让需要的人自己接。
+ */
+function wbf_purge_front_cache() {
+    $urls = array(home_url('/'));
+    $ids  = array();
+
+    $bySlug = get_page_by_path('boyou');
+    if ($bySlug && isset($bySlug->ID)) {
+        $ids[] = (int) $bySlug->ID;
+    }
+
+    $tplPages = get_posts(array(
+        'post_type'      => 'page',
+        'post_status'    => 'any',
+        'posts_per_page' => 20,
+        'fields'         => 'ids',
+        'meta_key'       => '_wp_page_template',
+        'meta_value'     => 'page-templates/template-rss.php',
+    ));
+    if (is_array($tplPages)) {
+        $ids = array_merge($ids, $tplPages);
+    }
+
+    foreach (array_unique($ids) as $id) {
+        $link = get_permalink((int) $id);
+        if ($link) {
+            $urls[] = $link;
+        }
+    }
+    $urls = array_values(array_unique(array_filter($urls)));
+
+    if (function_exists('rocket_clean_files')) {
+        rocket_clean_files($urls);
+    } elseif (function_exists('rocket_clean_domain')) {
+        // 老版本 WP Rocket 没有按 URL 清的接口，只能整站
+        rocket_clean_domain();
+    }
+
+    /**
+     * 其他缓存插件在这里接。
+     *
+     * @param array $urls 需要清掉的地址（首页 + 博友页）。
+     */
+    do_action('wbf_front_cache_purge', $urls);
 }
 
 /**
@@ -266,29 +353,75 @@ function wbf_get_token($apiBase, $user, $password) {
 
 /**
  * FreshRSS: 获取文章列表
+ *
+ * 为什么要翻页（1.6.5，2026-11-09）：
+ *   这里原来只发一个请求 `n=1000`，拿完就完。但 FreshRSS 的 reading-list 是
+ *   **按入库时间**倒序给的，不是按发布时间。只要有一个源被重新抓取、一次入库
+ *   上千条历史文章，它就把前 1000 个名额全占了，别的站的新文章被挤到 1000 名
+ *   之外 —— 2026-11-09 tumutanzi 一次入库 1800 条，两站的数据文件从 321 篇
+ *   缩到 23 篇，页面看上去像「整个博客圈停更了」。
+ *
+ *   所以改成顺着 continuation 往后翻：凑够 500 篇近一个月的（最终也就存 500 篇）
+ *   就停；某一页一条近 30 天的都没有、前面又已经收到上百篇，也停。
+ *   单页 500 条是为了控制单次内存 —— 1000 条 JSON 有 7 MB，翻几页就不好看了。
+ *
+ * @param string $apiBase   FreshRSS API 地址
+ * @param string $authToken 登录 token
+ * @param int    $perPage   每页条数
+ * @param int    $maxPages  最多翻几页
+ * @return array|false 文章数组；一页都没取到才返回 false
  */
-function wbf_get_articles($apiBase, $authToken) {
-    $url = $apiBase . '/reader/api/0/stream/contents/reading-list?n=1000';
+function wbf_get_articles($apiBase, $authToken, $perPage = 500, $maxPages = 5) {
+    $cut    = time() - 30 * 86400;
+    $all    = array();
+    $cont   = '';
+    $recent = 0;
+    $gotAny = false;
 
-    $response = wp_remote_get($url, array(
-        'timeout' => 30,
-        'headers' => array(
-            'Authorization' => 'GoogleLogin auth=' . $authToken,
-            'Accept' => 'application/json',
-        ),
-    ));
+    for ($page = 0; $page < $maxPages; $page++) {
+        $url = $apiBase . '/reader/api/0/stream/contents/reading-list?n=' . (int) $perPage;
+        if ($cont !== '') {
+            $url .= '&c=' . rawurlencode($cont);
+        }
 
-    if (is_wp_error($response)) return false;
+        $response = wp_remote_get($url, array(
+            'timeout' => 30,
+            'headers' => array(
+                'Authorization' => 'GoogleLogin auth=' . $authToken,
+                'Accept' => 'application/json',
+            ),
+        ));
 
-    $body = wp_remote_retrieve_body($response);
-    $code = wp_remote_retrieve_response_code($response);
+        if (is_wp_error($response)) break;
+        if (200 !== (int) wp_remote_retrieve_response_code($response)) break;
 
-    if ($code !== 200) return false;
+        $data = json_decode(wp_remote_retrieve_body($response), true);
+        if (!is_array($data) || !isset($data['items']) || !is_array($data['items'])) break;
 
-    $data = json_decode($body, true);
-    if (!is_array($data) || !isset($data['items'])) return false;
+        $gotAny = true;
+        $items  = $data['items'];
 
-    return $data['items'];
+        $pageRecent = 0;
+        foreach ($items as $it) {
+            if (isset($it['published']) && (int) $it['published'] >= $cut) {
+                $pageRecent++;
+            }
+        }
+
+        $recent += $pageRecent;
+        $all     = array_merge($all, $items);
+
+        // 最终只存 500 篇，够了就不必再往后翻
+        if ($recent >= 500) break;
+
+        // 这一页全是 30 天以前的老文章，且前面已经收到过上百篇 → 后面只会更老
+        if (0 === $pageRecent && $recent >= 100) break;
+
+        if (empty($data['continuation'])) break;
+        $cont = $data['continuation'];
+    }
+
+    return $gotAny ? $all : false;
 }
 
 /**
